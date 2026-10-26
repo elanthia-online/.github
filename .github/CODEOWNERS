@@ -1,3 +1,3 @@
-# Every change to this repository needs an Elanthia Online admin's approval:
+# Every change to this repository needs approval from an active Elanthia Online admin:
 # it holds the shared CI workflow and the branch protection definitions.
-*    @elanthia-online/eo-admins
+*    @mrhoribu @OSXLich-Doug @MahtraDR
