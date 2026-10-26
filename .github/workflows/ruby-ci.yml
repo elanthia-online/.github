@@ -1,0 +1,158 @@
+# Shared lint + test for Elanthia Online Ruby repositories.
+#
+# Called from each repo's ci.yml, pinned by full commit SHA:
+#   uses: elanthia-online/.github/.github/workflows/ruby-ci.yml@<commit-sha>
+#
+# The caller keeps its own `ci-gate` job, which is the only required status
+# check. Jobs here never skip at the job level: when nothing relevant changed
+# they skip their expensive steps and still report success, so a required
+# check can never hang waiting for a run that was filtered out.
+name: Ruby CI (shared)
+
+on:
+  workflow_call:
+    inputs:
+      lint-scope:
+        description: "repo = RuboCop over the whole repo; changed = only the files this push/PR changed"
+        type: string
+        default: repo
+      run-tests:
+        description: "Run bundle exec rspec here. Repos with special test setup run their own test job instead."
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  BUNDLE_WITHOUT: 'gtk:vscode:profanity'
+  # sha256 of rubocop/base.yml and rubocop/cops/ascii_only_source.rb in this
+  # repository at this commit. self-check.yml fails if they drift apart.
+  RUBOCOP_BASE_SHA256: fd8eefd3320e4e30d180be72267ef1d171ce15b1c3978ac278733cc6879fcf00
+  RUBOCOP_COP_SHA256: 5e1ead31cec879568fd815fac805b2643e16b02a44ae401f0a8d4a3aec25817b
+
+jobs:
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    outputs:
+      range: ${{ steps.classify.outputs.range }}
+      lint: ${{ steps.classify.outputs.lint }}
+      test: ${{ steps.classify.outputs.test }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Classify changed files
+        id: classify
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          zero=0000000000000000000000000000000000000000
+          range=""
+          if [ "$EVENT" = "pull_request" ] && [ -n "$PR_BASE" ]; then
+            range="$PR_BASE...HEAD"
+          elif [ -n "${PUSH_BEFORE:-}" ] && [ "$PUSH_BEFORE" != "$zero" ] && git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+            range="$PUSH_BEFORE..HEAD"
+          elif base=$(git merge-base "origin/$DEFAULT_BRANCH" HEAD 2>/dev/null) && [ "$base" != "$(git rev-parse HEAD)" ]; then
+            range="$base..HEAD"
+          fi
+          if [ -n "$range" ]; then
+            git diff --name-only -z --diff-filter=ACMR "$range" > "$RUNNER_TEMP/changed.z"
+          else
+            git ls-files -z > "$RUNNER_TEMP/changed.z"   # range unknown: treat every file as changed
+          fi
+          total=$(tr -cd '\0' < "$RUNNER_TEMP/changed.z" | wc -c)
+          ruby=$( { grep -zE '\.(rb|lic|rbw)$' "$RUNNER_TEMP/changed.z" || true; } | tr -cd '\0' | wc -c)
+          lint=false
+          if [ "$ruby" -gt 0 ] || grep -qzE '^(\.rubocop\.yml|\.rubocop/|Gemfile|Gemfile\.lock|\.ruby-version|\.github/)' "$RUNNER_TEMP/changed.z"; then lint=true; fi
+          # Tests are skipped only when every changed file is documentation or repo metadata.
+          test=false
+          if [ "$total" -eq 0 ] || grep -qzvE '(\.md$|^LICENSE|^\.gitignore$|^\.gitattributes$|^\.github/(ISSUE_TEMPLATE|PULL_REQUEST_TEMPLATE))' "$RUNNER_TEMP/changed.z"; then test=true; fi
+          [ -z "$range" ] && test=true
+          echo "Range: ${range:-<unknown, all files>}; changed=$total ruby=$ruby lint=$lint test=$test"
+          {
+            echo "range=$range"
+            echo "lint=$lint"
+            echo "test=$test"
+          } >> "$GITHUB_OUTPUT"
+
+  lint:
+    name: lint
+    needs: changes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Shared RuboCop config matches the master copy
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s  %s\n' "$RUBOCOP_BASE_SHA256" .rubocop/base.yml "$RUBOCOP_COP_SHA256" .rubocop/cops/ascii_only_source.rb | sha256sum -c - || {
+            echo "::error::.rubocop/base.yml or .rubocop/cops/ascii_only_source.rb differs from the shared master copy. Copy them from elanthia-online/.github (rubocop/) at the commit this workflow is pinned to."
+            exit 1
+          }
+      - uses: ruby/setup-ruby@7f797815d8adceb1c412e7abefdd1ab4abc47a5f # v1.335.0
+        if: needs.changes.outputs.lint == 'true'
+        with:
+          bundler-cache: true
+      - name: List changed Ruby files
+        if: needs.changes.outputs.lint == 'true'
+        shell: bash
+        env:
+          RANGE: ${{ needs.changes.outputs.range }}
+        run: |
+          set -euo pipefail
+          if [ -n "$RANGE" ]; then git diff --name-only -z --diff-filter=ACMR "$RANGE"; else git ls-files -z; fi \
+            | { grep -zE '\.(rb|lic|rbw)$' || true; } > "$RUNNER_TEMP/ruby.z"
+      - name: RuboCop (whole repo)
+        if: needs.changes.outputs.lint == 'true' && inputs.lint-scope == 'repo'
+        run: bundle exec rubocop --format github --format progress
+      - name: RuboCop (changed files)
+        if: needs.changes.outputs.lint == 'true' && inputs.lint-scope == 'changed'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -s "$RUNNER_TEMP/ruby.z" ]; then
+            xargs -0 bundle exec rubocop --force-exclusion --format github --format progress < "$RUNNER_TEMP/ruby.z"
+          else
+            echo "No changed Ruby files."
+          fi
+      - name: ruby -c (changed files)
+        if: needs.changes.outputs.lint == 'true'
+        shell: bash
+        run: |
+          status=0
+          while IFS= read -r -d '' f; do
+            [ -f "$f" ] || continue
+            ruby -c "$f" > /dev/null || { echo "::error file=$f::ruby -c failed"; status=1; }
+          done < "$RUNNER_TEMP/ruby.z"
+          exit $status
+      - name: Lint skipped
+        if: needs.changes.outputs.lint != 'true'
+        run: echo "No Ruby, RuboCop, Gemfile or workflow changes; lint skipped."
+
+  test:
+    name: test
+    needs: changes
+    if: inputs.run-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.changes.outputs.test == 'true'
+      - uses: ruby/setup-ruby@7f797815d8adceb1c412e7abefdd1ab4abc47a5f # v1.335.0
+        if: needs.changes.outputs.test == 'true'
+        with:
+          bundler-cache: true
+      - name: RSpec
+        if: needs.changes.outputs.test == 'true'
+        run: bundle exec rspec
+      - name: Tests skipped
+        if: needs.changes.outputs.test != 'true'
+        run: echo "Only documentation or metadata changed; tests skipped."

@@ -1,0 +1,8 @@
+{
+  "name": "pre/beta branches",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": { "ref_name": { "include": ["refs/heads/pre/beta", "refs/heads/pre/beta/**"], "exclude": [] } },
+  "bypass_actors": [],
+  "rules": [ { "type": "deletion" } ]
+}

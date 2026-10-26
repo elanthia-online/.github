@@ -1,0 +1,25 @@
+# Keeps this repository consistent: the RuboCop hashes in ruby-ci.yml must
+# match rubocop/, and every ruleset definition must be valid JSON. The job is
+# named ci-gate because this repo's own ruleset requires a check by that name.
+name: self-check
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  ci-gate:
+    name: ci-gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: RuboCop hashes in ruby-ci.yml match rubocop/
+        run: |
+          set -euo pipefail
+          base=$(grep -oP 'RUBOCOP_BASE_SHA256: \K[0-9a-f]{64}' .github/workflows/ruby-ci.yml)
+          cop=$(grep -oP 'RUBOCOP_COP_SHA256: \K[0-9a-f]{64}' .github/workflows/ruby-ci.yml)
+          printf '%s  %s\n' "$base" rubocop/base.yml "$cop" rubocop/cops/ascii_only_source.rb | sha256sum -c -
+      - name: Ruleset definitions are valid JSON
+        run: |
+          set -euo pipefail
+          for f in rulesets/*.json; do jq -e . "$f" > /dev/null && echo "valid JSON: $f"; done
