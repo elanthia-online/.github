@@ -11,7 +11,7 @@ Thanks for helping. These are the defaults for every Elanthia Online repository 
 
 ## Checks
 
-Before pushing, run the same checks as the repository's CI. Its workflows in `.github/workflows/` show the exact commands, including any setup steps.
+Before pushing, run the same checks as the repository's CI, if it has any. Its workflows in `.github/workflows/` show the exact commands, including any setup steps.
 
 ### lich-5, dr-scripts, scripts and ProfanityFE
 
@@ -34,7 +34,7 @@ These repositories share one Ruby CI setup and one set of branch protection rule
 
 ### Other repositories
 
-Follow the repository's README and CI workflows for setup and checks.
+Follow the repository's README, and its CI workflows if it has any, for setup and checks.
 
 ## Security issues
 
