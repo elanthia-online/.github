@@ -1,0 +1,91 @@
+# Shared check that a repository's Gemfile.lock and .ruby-version are aligned
+# with lich-5's; see bin/sync-lockfile for what "aligned" means.
+#
+# Called from each repo's ci.yml, pinned by full commit SHA, and listed in
+# that repo's ci-gate `needs`:
+#   lockfile:
+#     uses: elanthia-online/.github/.github/workflows/lockfile-sync.yml@<commit-sha>
+#
+# On a pull request it fails only for drift the PR adds, judged against the
+# base branch, so a lich-5 update never fails an unrelated PR while a PR that
+# moves a shared gem away from lich-5 (a Dependabot bump, say) still fails.
+# On any other event it fails for all drift: a scheduled run is how a repo
+# learns that lich-5 has moved. Either way the fix is to run, in the repo:
+#   curl -fsSL https://raw.githubusercontent.com/elanthia-online/.github/main/bin/sync-lockfile | ruby -
+name: Lockfile sync (shared)
+
+on:
+  workflow_call:
+    inputs:
+      reference:
+        description: "Directory or OWNER/REPO[@REF] holding the reference Gemfile.lock and .ruby-version"
+        type: string
+        default: elanthia-online/lich-5@main
+      directory:
+        description: "Directory of the Gemfile.lock to check, relative to the repo root"
+        type: string
+        default: .
+
+permissions:
+  contents: read
+
+jobs:
+  lockfile:
+    name: lockfile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The script comes from this workflow's own commit, so a caller pinned
+      # to a SHA runs the script from that SHA.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .lockfile-sync
+          sparse-checkout: bin/sync-lockfile
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: ruby/setup-ruby@7f797815d8adceb1c412e7abefdd1ab4abc47a5f # v1.335.0
+        with:
+          working-directory: ${{ inputs.directory }}
+      - name: Check Gemfile.lock and .ruby-version against the reference
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          REFERENCE: ${{ inputs.reference }}
+          DIR: ${{ inputs.directory }}
+        run: |
+          set -euo pipefail
+          script="$GITHUB_WORKSPACE/.lockfile-sync/bin/sync-lockfile"
+          args=(--check --reference "$REFERENCE")
+          if [ "$EVENT" = "pull_request" ] && [ -n "$PR_BASE" ]; then
+            git fetch --no-tags --depth=1 origin "$PR_BASE"
+            base="$RUNNER_TEMP/lockfile-base"
+            mkdir -p "$base"
+            # A file the base branch doesn't have is simply left out.
+            for f in Gemfile.lock .ruby-version; do
+              git show "$PR_BASE:./$DIR/$f" > "$base/$f" 2>/dev/null || rm -f "$base/$f"
+            done
+            args+=(--baseline "$base")
+          fi
+          set +e
+          ruby "$script" "${args[@]}" "$DIR" | tee "$RUNNER_TEMP/lockfile-sync.txt"
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            {
+              echo "### Gemfile.lock is not aligned with $REFERENCE"
+              echo '```'
+              cat "$RUNNER_TEMP/lockfile-sync.txt"
+              echo '```'
+              echo 'To align it, run this in the repository and commit the result:'
+              echo '```'
+              echo 'curl -fsSL https://raw.githubusercontent.com/elanthia-online/.github/main/bin/sync-lockfile | ruby -'
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Gemfile.lock is not aligned with $REFERENCE; see the job summary."
+          fi
+          exit "$status"

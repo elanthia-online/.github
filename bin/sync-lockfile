@@ -1,0 +1,267 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Keep a repository's Gemfile.lock and .ruby-version aligned with lich-5's.
+#
+#   bin/sync-lockfile [--reference SRC] [DIR]
+#   bin/sync-lockfile --check [--reference SRC] [--baseline BASE_DIR] [DIR]
+#
+# lich-5 is the reference for every Elanthia Online Ruby repository. A
+# repository is aligned with it when:
+#   - .ruby-version is the same;
+#   - BUNDLED WITH is the same;
+#   - PLATFORMS is the same list;
+#   - every gem both lockfiles contain is locked at the same version.
+# Gems that only one side uses don't count.
+#
+# Without --check it rewrites DIR's Gemfile.lock and .ruby-version to align,
+# keeping the versions of DIR's own gems, then runs `bundle lock` with the
+# reference's Bundler so the result is a real resolution. It exits 1 if a
+# shared gem still differs afterwards (DIR's Gemfile or one of its own gems
+# needs a version the reference doesn't lock).
+#
+# --check changes nothing and exits 1 if DIR has drifted. With --baseline
+# BASE_DIR (the same two files before a change), it exits 1 only for drift
+# BASE_DIR doesn't already have, so a reference update never fails unrelated
+# changes while a change that adds drift still fails.
+#
+# SRC is a directory holding the reference files, or OWNER/REPO[@REF] fetched
+# from GitHub (default elanthia-online/lich-5@main). DIR defaults to the
+# current directory.
+
+require 'bundler'
+require 'fileutils'
+require 'net/http'
+require 'optparse'
+require 'tmpdir'
+
+module LockfileSync
+  DEFAULT_REFERENCE = 'elanthia-online/lich-5@main'
+  FILES = ['Gemfile.lock', '.ruby-version'].freeze
+  # Lockfile sections the merge knows how to rebuild. GIT and PATH sources
+  # would need their own merge; no Elanthia Online repo uses them.
+  KNOWN_SECTIONS = ['GEM', 'PLATFORMS', 'DEPENDENCIES', 'CHECKSUMS', 'RUBY VERSION', 'BUNDLED WITH'].freeze
+
+  class Error < StandardError; end
+
+  # One way a target differs from the reference. +key+ names what differs and
+  # +value+ is the target's side, so the same drift on both sides of a change
+  # compares equal.
+  Drift = Struct.new(:key, :value, :reference_value) do
+    def to_s
+      "#{key}: #{value || '(none)'} here, #{reference_value || '(none)'} in the reference"
+    end
+  end
+
+  # The two files of one repository, read from a directory.
+  class Snapshot
+    attr_reader :lockfile_text, :ruby_version
+
+    def self.read(dir)
+      lock = File.join(dir, 'Gemfile.lock')
+      ruby = File.join(dir, '.ruby-version')
+      new(File.exist?(lock) ? File.read(lock) : nil,
+          File.exist?(ruby) ? File.read(ruby).strip : nil)
+    end
+
+    def initialize(lockfile_text, ruby_version)
+      @lockfile_text = lockfile_text
+      @ruby_version = ruby_version
+    end
+
+    def lockfile?
+      !@lockfile_text.nil?
+    end
+
+    def parsed
+      @parsed ||= Bundler::LockfileParser.new(@lockfile_text)
+    end
+
+    def bundler_version
+      parsed.bundler_version&.to_s
+    end
+
+    def platforms
+      parsed.platforms.map(&:to_s).sort
+    end
+
+    # gem name => sorted versions, platform variants folded together.
+    def gem_versions
+      @gem_versions ||= parsed.specs.group_by(&:name).transform_values { |specs| specs.map { |s| s.version.to_s }.uniq.sort }
+    end
+  end
+
+  module_function
+
+  # Every way +target+ differs from +reference+, as Drift records.
+  def drift(target, reference)
+    raise Error, 'the reference has no Gemfile.lock' unless reference.lockfile?
+    return [Drift.new('Gemfile.lock', nil, 'present')] unless target.lockfile?
+
+    found = []
+    found << Drift.new('.ruby-version', target.ruby_version, reference.ruby_version) if target.ruby_version != reference.ruby_version
+    found << Drift.new('BUNDLED WITH', target.bundler_version, reference.bundler_version) if target.bundler_version != reference.bundler_version
+    if target.platforms != reference.platforms
+      found << Drift.new('PLATFORMS', target.platforms.join(' '), reference.platforms.join(' '))
+    end
+    ours = target.gem_versions
+    theirs = reference.gem_versions
+    (ours.keys & theirs.keys).sort.each do |name|
+      next if ours[name] == theirs[name]
+
+      found << Drift.new("gem #{name}", ours[name].join(', '), theirs[name].join(', '))
+    end
+    found
+  end
+
+  # The drift in +target+ that +baseline+ doesn't have with the same value.
+  def new_drift(target, baseline, reference)
+    before = drift(baseline, reference).map { |d| [d.key, d.value] }
+    drift(target, reference).reject { |d| before.include?([d.key, d.value]) }
+  end
+
+  # Splits lockfile text into [header, body lines] pairs.
+  def sections(text)
+    text.split(/\n{2,}/).map do |chunk|
+      header, *body = chunk.lines(chomp: true)
+      [header, body]
+    end
+  end
+
+  def section(text, name)
+    sections(text).find { |header, _| header == name }&.last
+  end
+
+  # Spec blocks from a GEM section body: gem name => the spec lines (each
+  # version and platform variant, with its dependency lines).
+  def spec_blocks(gem_body)
+    blocks = Hash.new { |h, k| h[k] = [] }
+    current = nil
+    gem_body.each do |line|
+      if (m = line.match(/\A {4}(\S+) \(/))
+        current = blocks[m[1]]
+      elsif !line.start_with?('      ')
+        current = nil
+        next
+      end
+      current << line if current
+    end
+    blocks
+  end
+
+  # Rebuilds the target lockfile text from the reference: the reference's
+  # specs, platforms, checksums and Bundler version, plus the target's own
+  # gems (spec blocks and checksums). DEPENDENCIES is left out on purpose:
+  # when it matches the Gemfile, `bundle lock` trusts the specs as they are
+  # and keeps every reference gem. Without it Bundler resolves again, still
+  # preferring the locked versions, and drops gems the target doesn't use.
+  def merge(target_text, reference_text)
+    # A Windows checkout with core.autocrlf has CRLF line endings, which would
+    # hide the blank lines between sections.
+    target_text = target_text.gsub("\r\n", "\n")
+    reference_text = reference_text.gsub("\r\n", "\n")
+    [target_text, reference_text].each do |text|
+      unknown = sections(text).map(&:first) - KNOWN_SECTIONS
+      raise Error, "can't merge lockfile sections #{unknown.join(', ')}" unless unknown.empty?
+    end
+
+    target_gem = section(target_text, 'GEM') or raise Error, 'the target Gemfile.lock has no GEM section'
+    reference_gem = section(reference_text, 'GEM') or raise Error, 'the reference Gemfile.lock has no GEM section'
+    reference_specs = spec_blocks(reference_gem)
+    own_specs = spec_blocks(target_gem).reject { |name, _| reference_specs.key?(name) }
+    specs = reference_specs.merge(own_specs).sort.flat_map(&:last)
+    remote = target_gem.find { |l| l.start_with?('  remote: ') }
+
+    out = ["GEM\n#{remote}\n  specs:\n#{specs.join("\n")}"]
+    out << "PLATFORMS\n#{section(reference_text, 'PLATFORMS').join("\n")}"
+    reference_sums = section(reference_text, 'CHECKSUMS')
+    target_sums = section(target_text, 'CHECKSUMS')
+    if reference_sums || target_sums
+      sum_name = ->(line) { line[/\A {2}(\S+) \(/, 1] }
+      reference_names = (reference_sums || []).map(&sum_name)
+      own_sums = (target_sums || []).reject { |l| reference_names.include?(sum_name.call(l)) }
+      out << "CHECKSUMS\n#{((reference_sums || []) + own_sums).sort_by { |l| sum_name.call(l).to_s }.join("\n")}"
+    end
+    ruby = section(target_text, 'RUBY VERSION')
+    out << "RUBY VERSION\n#{ruby.join("\n")}" if ruby
+    out << "BUNDLED WITH\n#{section(reference_text, 'BUNDLED WITH').join("\n")}"
+    "#{out.join("\n\n")}\n"
+  end
+
+  # Writes the reference files into a temporary directory and yields it.
+  # +source+ is a directory or OWNER/REPO[@REF].
+  def with_reference(source)
+    return yield(source) if File.directory?(source)
+
+    repo, ref = source.split('@', 2)
+    raise Error, "reference must be a directory or OWNER/REPO[@REF], got #{source.inspect}" unless repo&.match?(%r{\A[\w.-]+/[\w.-]+\z})
+
+    Dir.mktmpdir('sync-lockfile') do |dir|
+      FILES.each do |file|
+        uri = URI("https://raw.githubusercontent.com/#{repo}/#{ref || 'main'}/#{file}")
+        res = Net::HTTP.get_response(uri)
+        raise Error, "couldn't fetch #{uri}: HTTP #{res.code}" unless res.is_a?(Net::HTTPSuccess)
+
+        File.write(File.join(dir, file), res.body)
+      end
+      yield dir
+    end
+  end
+
+  # Aligns +dir+ with the reference in +reference_dir+; returns the drift
+  # that remains after `bundle lock`.
+  def sync(dir, reference_dir)
+    reference = Snapshot.read(reference_dir)
+    target = Snapshot.read(dir)
+    raise Error, "#{dir} has no Gemfile.lock" unless target.lockfile?
+    raise Error, 'the reference has no Gemfile.lock' unless reference.lockfile?
+
+    bundler = reference.bundler_version
+    unless Gem::Specification.find_all_by_name('bundler', bundler).any? { |s| File.exist?(s.bin_file('bundle')) }
+      raise Error, "Bundler #{bundler} isn't installed; run: gem install bundler -v #{bundler}"
+    end
+
+    File.write(File.join(dir, 'Gemfile.lock'), merge(target.lockfile_text, reference.lockfile_text))
+    File.write(File.join(dir, '.ruby-version'), "#{reference.ruby_version}\n") if reference.ruby_version
+    env = { 'BUNDLE_GEMFILE' => File.join(File.expand_path(dir), 'Gemfile'), 'BUNDLE_FROZEN' => nil, 'BUNDLE_DEPLOYMENT' => nil }
+    ok = Bundler.with_unbundled_env { system(env, 'bundle', "_#{bundler}_", 'lock', chdir: dir) }
+    raise Error, "bundle lock failed in #{dir}" unless ok
+
+    drift(Snapshot.read(dir), reference)
+  end
+
+  def main(argv)
+    check = false
+    reference = DEFAULT_REFERENCE
+    baseline = nil
+    OptionParser.new do |o|
+      o.banner = 'usage: sync-lockfile [--check] [--reference SRC] [--baseline BASE_DIR] [DIR]'
+      o.on('--check') { check = true }
+      o.on('--reference SRC') { |v| reference = v }
+      o.on('--baseline BASE_DIR') { |v| baseline = v }
+    end.parse!(argv)
+    dir = argv.shift || '.'
+    raise Error, '--baseline only applies with --check' if baseline && !check
+
+    with_reference(reference) do |reference_dir|
+      ref = Snapshot.read(reference_dir)
+      if check
+        all = drift(Snapshot.read(dir), ref)
+        failing = baseline ? new_drift(Snapshot.read(dir), Snapshot.read(baseline), ref) : all
+        all.each { |d| puts "#{failing.include?(d) ? 'drift' : 'drift (already on the base branch)'}: #{d}" }
+        puts "aligned with #{reference}" if all.empty?
+        return failing.empty? ? 0 : 1
+      end
+
+      remaining = sync(dir, reference_dir)
+      remaining.each { |d| warn "still differs: #{d}" }
+      puts "aligned with #{reference}" if remaining.empty?
+      remaining.empty? ? 0 : 1
+    end
+  rescue Error, OptionParser::ParseError => e
+    warn "sync-lockfile: #{e.message}"
+    2
+  end
+end
+
+exit LockfileSync.main(ARGV) if $PROGRAM_NAME == __FILE__

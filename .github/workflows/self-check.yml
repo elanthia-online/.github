@@ -1,6 +1,8 @@
 # Keeps this repository consistent: the RuboCop hashes in ruby-ci.yml must
-# match rubocop/, and every ruleset definition must be valid JSON. The job is
-# named ci-gate because this repo's own ruleset requires a check by that name.
+# match rubocop/, every ruleset definition must be valid JSON, and
+# bin/sync-lockfile and the lockfile-sync workflow must work. The ci-gate job
+# is named ci-gate because this repo's own ruleset requires a check by that
+# name.
 name: self-check
 on:
   push:
@@ -8,8 +10,8 @@ on:
 permissions:
   contents: read
 jobs:
-  ci-gate:
-    name: ci-gate
+  consistency:
+    name: consistency
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -23,3 +25,38 @@ jobs:
         run: |
           set -euo pipefail
           for f in rulesets/*.json; do jq -e . "$f" > /dev/null && echo "valid JSON: $f"; done
+
+  sync-lockfile:
+    name: sync-lockfile tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ruby/setup-ruby@7f797815d8adceb1c412e7abefdd1ab4abc47a5f # v1.335.0
+        with:
+          ruby-version: '4.0'
+      # Includes two tests that run `bundle lock` against rubygems.org.
+      - run: ruby test/sync_lockfile_test.rb
+
+  # Runs the shared workflow the way a repo calls it, against fixtures, so a
+  # change that breaks it (its own checkout by job.workflow_sha, say) fails
+  # here before any repo pins it.
+  lockfile-sync-workflow:
+    uses: ./.github/workflows/lockfile-sync.yml
+    with:
+      reference: test/fixtures/lockfile-sync/reference
+      directory: test/fixtures/lockfile-sync/aligned
+
+  ci-gate:
+    name: ci-gate
+    if: always()
+    needs: [consistency, sync-lockfile, lockfile-sync-workflow]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every job to pass
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          echo "$NEEDS" | jq -e 'all(.[]; .result == "success")' > /dev/null

@@ -1,0 +1,16 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    rake (13.4.2)
+    yard (0.9.45)
+
+PLATFORMS
+  arm64-darwin
+  x86_64-linux
+
+DEPENDENCIES
+  rake
+  yard
+
+BUNDLED WITH
+  4.0.23
