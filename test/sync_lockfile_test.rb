@@ -288,6 +288,125 @@ class SyncLockfileTest < Minitest::Test
     assert_equal 2, run_main('--frobnicate').first
   end
 
+  def test_unexpected_error_exits_2_not_1
+    with_stub(LockfileSync, :drift, ->(*) { raise NoMethodError, 'boom' }) do
+      Dir.mktmpdir do |d|
+        code, _, err = run_main('--check', '--reference', write_repo("#{d}/ref", reference_lock), write_repo("#{d}/t", target_lock))
+        assert_equal 2, code, 'exit 1 means drift, so a crash must not use it'
+        assert_match(/NoMethodError: boom/, err)
+      end
+    end
+  end
+
+  # --- fetching the reference from GitHub (Net::HTTP stubbed) ---
+
+  # Replaces +obj+'s singleton method +name+ for the block.
+  def with_stub(obj, name, impl)
+    sc = obj.singleton_class
+    own = sc.instance_methods(false).include?(name) || sc.private_instance_methods(false).include?(name)
+    sc.alias_method(:"__stubbed_#{name}", name) if own
+    sc.define_method(name, &impl)
+    yield
+  ensure
+    sc.remove_method(name)
+    if own
+      sc.alias_method(name, :"__stubbed_#{name}")
+      sc.remove_method(:"__stubbed_#{name}")
+    end
+  end
+
+  def http_reply(klass, code, body = '')
+    res = klass.new('1.1', code, '')
+    res.instance_variable_set(:@body, body)
+    res.instance_variable_set(:@read, true)
+    res
+  end
+
+  # Serves +replies+ (an HTTP reply or an exception per request, in order;
+  # the last one repeats) for raw.githubusercontent.com, with lockfile bodies
+  # filled in for 200s. Yields the list of Net::HTTP.start keyword arguments
+  # and the delays slept between attempts.
+  def with_github(replies)
+    starts = []
+    sleeps = []
+    queue = replies.dup
+    lockfile = reference_lock
+    fake = Object.new
+    fake.define_singleton_method(:request_get) do |uri, *|
+      reply = queue.size > 1 ? queue.shift : queue.first
+      raise reply if reply.is_a?(Exception)
+
+      path = uri.is_a?(URI) ? uri.path : uri
+      reply.instance_variable_set(:@body, path.end_with?('.ruby-version') ? "4.0.9\n" : reply.body.to_s.empty? ? lockfile : reply.body) if reply.is_a?(Net::HTTPOK)
+      reply
+    end
+    fake.define_singleton_method(:get) { |path, *| request_get(path) }
+    with_stub(Net::HTTP, :start, lambda { |_host, _port = nil, *_, **opts, &blk|
+      starts << opts
+      blk.call(fake)
+    }) do
+      with_stub(LockfileSync, :sleep, ->(s) { sleeps << s }) { yield starts, sleeps }
+    end
+  end
+
+  def check_against_github(dir)
+    run_main('--check', '--reference', 'elanthia-online/lich-5@main', write_repo(dir, target_lock))
+  end
+
+  def test_fetch_sets_timeouts
+    with_github([http_reply(Net::HTTPOK, '200')]) do |starts, _|
+      Dir.mktmpdir { |d| assert_equal 0, check_against_github("#{d}/t").first }
+      assert(starts.all? { |o| o[:open_timeout] && o[:read_timeout] }, "no timeouts in #{starts.inspect}")
+    end
+  end
+
+  def test_fetch_retries_a_server_error
+    with_github([http_reply(Net::HTTPServiceUnavailable, '503'), http_reply(Net::HTTPOK, '200')]) do |starts, sleeps|
+      Dir.mktmpdir do |d|
+        code, _, err = check_against_github("#{d}/t")
+        assert_equal 0, code, err
+        assert_match(/HTTP 503; retrying/, err)
+      end
+      assert_equal 3, starts.size, 'one retry for the first file, then one request for the second'
+      assert_equal 1, sleeps.size
+    end
+  end
+
+  def test_fetch_retries_a_connection_error_then_gives_up_with_exit_2
+    with_github([SocketError.new('getaddrinfo failed')]) do |starts, sleeps|
+      Dir.mktmpdir do |d|
+        code, _, err = check_against_github("#{d}/t")
+        assert_equal 2, code, 'a network failure is not drift'
+        assert_match(/couldn't fetch .*Gemfile\.lock: SocketError: getaddrinfo failed/, err)
+      end
+      assert_equal LockfileSync::FETCH_ATTEMPTS, starts.size
+      assert_equal LockfileSync::FETCH_ATTEMPTS - 1, sleeps.size
+    end
+  end
+
+  def test_fetch_retries_rate_limiting
+    with_github([http_reply(Net::HTTPTooManyRequests, '429')]) do |starts, _|
+      Dir.mktmpdir do |d|
+        code, _, err = check_against_github("#{d}/t")
+        assert_equal 2, code
+        assert_match(/couldn't fetch .*: HTTP 429/, err)
+      end
+      assert_equal LockfileSync::FETCH_ATTEMPTS, starts.size
+    end
+  end
+
+  def test_fetch_does_not_retry_not_found
+    with_github([http_reply(Net::HTTPNotFound, '404')]) do |starts, sleeps|
+      Dir.mktmpdir do |d|
+        code, _, err = check_against_github("#{d}/t")
+        assert_equal 2, code
+        assert_match(/HTTP 404/, err)
+      end
+      assert_equal 1, starts.size
+      assert_empty sleeps
+    end
+  end
+
   # --- sync against rubygems.org (runs a real `bundle lock`) ---
 
   def installed_bundler

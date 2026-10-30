@@ -25,6 +25,10 @@
 # BASE_DIR doesn't already have, so a reference update never fails unrelated
 # changes while a change that adds drift still fails.
 #
+# Exit 2 means it couldn't do the job at all (bad arguments, a reference it
+# couldn't fetch after retrying, a missing Bundler, an unexpected error), so
+# exit 1 always means drift.
+#
 # SRC is a directory holding the reference files, or OWNER/REPO[@REF] fetched
 # from GitHub (default elanthia-online/lich-5@main). DIR defaults to the
 # current directory.
@@ -32,6 +36,7 @@
 require 'bundler'
 require 'fileutils'
 require 'net/http'
+require 'openssl'
 require 'optparse'
 require 'tmpdir'
 
@@ -43,6 +48,11 @@ module LockfileSync
   KNOWN_SECTIONS = ['GEM', 'PLATFORMS', 'DEPENDENCIES', 'CHECKSUMS', 'RUBY VERSION', 'BUNDLED WITH'].freeze
 
   class Error < StandardError; end
+
+  # Fetching a reference from GitHub: attempts per file, and errors that are
+  # worth another attempt (connection failures and timeouts).
+  FETCH_ATTEMPTS = 3
+  RETRYABLE_ERRORS = [IOError, SystemCallError, SocketError, Timeout::Error, OpenSSL::SSL::SSLError, Net::HTTPBadResponse].freeze
 
   # One way a target differs from the reference. +key+ names what differs and
   # +value+ is the target's side, so the same drift on both sides of a change
@@ -199,12 +209,32 @@ module LockfileSync
     Dir.mktmpdir('sync-lockfile') do |dir|
       FILES.each do |file|
         uri = URI("https://raw.githubusercontent.com/#{repo}/#{ref || 'main'}/#{file}")
-        res = Net::HTTP.get_response(uri)
-        raise Error, "couldn't fetch #{uri}: HTTP #{res.code}" unless res.is_a?(Net::HTTPSuccess)
-
-        File.write(File.join(dir, file), res.body)
+        File.write(File.join(dir, file), fetch(uri))
       end
       yield dir
+    end
+  end
+
+  # Returns the body of +uri+. Connection failures, timeouts, 429 and 5xx are
+  # retried, so a blip at GitHub doesn't fail a repo's CI; anything else, or
+  # the last failed attempt, raises Error.
+  def fetch(uri)
+    FETCH_ATTEMPTS.times do |attempt|
+      last = attempt == FETCH_ATTEMPTS - 1
+      begin
+        res = Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == 'https', open_timeout: 10, read_timeout: 30) do |http|
+          http.get(uri.request_uri)
+        end
+        return res.body if res.is_a?(Net::HTTPSuccess)
+
+        problem = "HTTP #{res.code}"
+        raise Error, "couldn't fetch #{uri}: #{problem}" if last || !(res.code == '429' || res.is_a?(Net::HTTPServerError))
+      rescue *RETRYABLE_ERRORS => e
+        problem = "#{e.class}: #{e.message}"
+        raise Error, "couldn't fetch #{uri}: #{problem}" if last
+      end
+      warn "sync-lockfile: #{uri}: #{problem}; retrying"
+      sleep(2 * (attempt + 1))
     end
   end
 
@@ -260,6 +290,9 @@ module LockfileSync
     end
   rescue Error, OptionParser::ParseError => e
     warn "sync-lockfile: #{e.message}"
+    2
+  rescue StandardError => e
+    warn "sync-lockfile: unexpected #{e.class}: #{e.message}", *e.backtrace&.first(5)
     2
   end
 end
