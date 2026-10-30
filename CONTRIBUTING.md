@@ -17,7 +17,7 @@ Before pushing, run the same checks as the repository's CI, if it has any. Its w
 
 These repositories share one Ruby CI setup and one set of branch protection rules:
 
-- The default branch is protected. Changes land through pull requests only, every pull request must pass the `ci-gate` check (it sums up lint, tests and any repo-specific checks), review conversations must be resolved before merging, and merges are squashed.
+- The default branch is protected. Changes land through pull requests only, every pull request needs one approving review and must pass the `ci-gate` check (it sums up lint, tests and any repo-specific checks), review conversations must be resolved before merging, and merges are squashed. Pushing new commits dismisses earlier approvals.
 - To run the checks locally:
 
   ```sh
@@ -30,7 +30,7 @@ These repositories share one Ruby CI setup and one set of branch protection rule
 - The Ruby version CI uses is in `.ruby-version`.
 - RuboCop is pinned to an exact version in the `Gemfile`; use it through `bundle exec`, because a different version can disagree with CI.
 - The RuboCop rules are shared. `.rubocop/base.yml` and `.rubocop/cops/` are byte-identical copies of the masters in [elanthia-online/.github](https://github.com/elanthia-online/.github), and CI fails if they differ. Don't edit them in a repository; propose rule changes in `elanthia-online/.github`. A repository's `.rubocop.yml` may only list files to exclude.
-- Changes under `.github/` (workflows and CI configuration) are routed to the Elanthia Online admins for review, because workflows can publish releases and use repository secrets.
+- Changes under `.github/` (workflows and CI configuration) need an approval from an Elanthia Online admin, because workflows can publish releases and use repository secrets.
 
 ### Other repositories
 
