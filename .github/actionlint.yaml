@@ -1,0 +1,8 @@
+# actionlint 1.7.12 doesn't know the job.workflow_* context properties yet,
+# though GitHub documents them and lockfile-sync.yml uses them to check out
+# its own script. Upstream fix: https://github.com/rhysd/actionlint/pull/707
+# Remove this once a release includes it.
+paths:
+  .github/workflows/lockfile-sync.yml:
+    ignore:
+      - 'property "workflow_(repository|sha)" is not defined in object type'
