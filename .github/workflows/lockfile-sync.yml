@@ -60,28 +60,44 @@ jobs:
         run: |
           set -euo pipefail
           script="$GITHUB_WORKSPACE/.lockfile-sync/bin/sync-lockfile"
+          out="$RUNNER_TEMP/lockfile-sync.txt"
+          : > "$out"
           args=(--check --reference "$REFERENCE")
+          status=0
           if [ "$EVENT" = "pull_request" ] && [ -n "$PR_BASE" ]; then
-            git fetch --no-tags --depth=1 origin "$PR_BASE"
-            base="$RUNNER_TEMP/lockfile-base"
-            mkdir -p "$base"
-            # A file the base branch doesn't have is simply left out.
-            for f in Gemfile.lock .ruby-version; do
-              git show "$PR_BASE:./$DIR/$f" > "$base/$f" 2>/dev/null || rm -f "$base/$f"
-            done
-            args+=(--baseline "$base")
+            # A failed fetch is reported like a script error (exit 2), never
+            # as drift, even if git exits 1. Its output only goes into the
+            # summary when it fails.
+            fetch_log="$RUNNER_TEMP/lockfile-base-fetch.txt"
+            if git fetch --no-tags --depth=1 origin "$PR_BASE" > "$fetch_log" 2>&1; then
+              cat "$fetch_log"
+              base="$RUNNER_TEMP/lockfile-base"
+              mkdir -p "$base"
+              # A file the base branch doesn't have is simply left out.
+              for f in Gemfile.lock .ruby-version; do
+                git show "$PR_BASE:./$DIR/$f" > "$base/$f" 2>/dev/null || rm -f "$base/$f"
+              done
+              args+=(--baseline "$base")
+            else
+              rc=$?
+              tee -a "$out" < "$fetch_log"
+              echo "Couldn't fetch the pull request's base commit $PR_BASE (git exit $rc)." | tee -a "$out"
+              status=2
+            fi
           fi
-          set +e
-          # stderr too: the script reports its own failures there.
-          ruby "$script" "${args[@]}" "$DIR" 2>&1 | tee "$RUNNER_TEMP/lockfile-sync.txt"
-          status=${PIPESTATUS[0]}
-          set -e
+          if [ "$status" -eq 0 ]; then
+            set +e
+            # stderr too: the script reports its own failures there.
+            ruby "$script" "${args[@]}" "$DIR" 2>&1 | tee -a "$out"
+            status=${PIPESTATUS[0]}
+            set -e
+          fi
           # Exit 1 is drift; any other failure means the check couldn't run.
           if [ "$status" -eq 1 ]; then
             {
               echo "### Gemfile.lock is not aligned with $REFERENCE"
               echo '```'
-              cat "$RUNNER_TEMP/lockfile-sync.txt"
+              cat "$out"
               echo '```'
               echo 'To align it, run this in the repository and commit the result:'
               echo '```'
@@ -93,10 +109,10 @@ jobs:
             {
               echo "### Couldn't check Gemfile.lock against $REFERENCE"
               echo '```'
-              cat "$RUNNER_TEMP/lockfile-sync.txt"
+              cat "$out"
               echo '```'
               echo "This isn't drift. If the error above is a network problem, rerun the job."
             } >> "$GITHUB_STEP_SUMMARY"
-            echo "::error::sync-lockfile couldn't run the check (exit $status); see the job summary."
+            echo "::error::Couldn't check Gemfile.lock against $REFERENCE (exit $status); see the job summary."
           fi
           exit "$status"

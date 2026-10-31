@@ -12,7 +12,9 @@
 #   - BUNDLED WITH is the same;
 #   - PLATFORMS is the same list;
 #   - every gem both lockfiles contain is locked at the same version.
-# Gems that only one side uses don't count.
+# Gems that only one side uses don't count. Neither does the lockfile's
+# RUBY VERSION section: `bundle lock` rebuilds it from each repo's own Gemfile
+# `ruby` directive, and .ruby-version is the shared input.
 #
 # Without --check it rewrites DIR's Gemfile.lock and .ruby-version to align,
 # keeping the versions of DIR's own gems, then runs `bundle lock` with the
