@@ -98,7 +98,7 @@ jobs:
             echo "::error::.rubocop/base.yml or .rubocop/cops/ascii_only_source.rb differs from the shared master copy. Copy them from elanthia-online/.github (rubocop/) at the commit this workflow is pinned to."
             exit 1
           }
-      - uses: ruby/setup-ruby@7f797815d8adceb1c412e7abefdd1ab4abc47a5f # v1.335.0
+      - uses: ruby/setup-ruby@de492cf36cbab201753d720ce4f4e336cd688c94 # v1.336.0
         if: needs.changes.outputs.lint == 'true'
         with:
           bundler-cache: true
@@ -146,7 +146,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.changes.outputs.test == 'true'
-      - uses: ruby/setup-ruby@7f797815d8adceb1c412e7abefdd1ab4abc47a5f # v1.335.0
+      - uses: ruby/setup-ruby@de492cf36cbab201753d720ce4f4e336cd688c94 # v1.336.0
         if: needs.changes.outputs.test == 'true'
         with:
           bundler-cache: true
