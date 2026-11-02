@@ -9,7 +9,7 @@ Shared CI and repository standards for Elanthia Online projects.
 | `rulesets/` | Branch and tag protection definitions. |
 | `bin/apply-rulesets` | Applies the rulesets and shared repository settings. Run by an admin after a change to `rulesets/` merges; see the comment at the top of the script. |
 | `bin/sync-lockfile` | Aligns a repo's `Gemfile.lock` and `.ruby-version` with lich-5's, or checks that they are aligned (`--check`). See the comment at the top of the script. |
-| `.github/workflows/lockfile-sync.yml` | Shared check that runs `bin/sync-lockfile --check`. Repos call it from their own `ci.yml`, pinned to a release like `ruby-ci.yml`, and list it in `ci-gate`. |
+| `.github/workflows/lockfile-sync.yml` | Shared check that runs `bin/sync-lockfile --check`. A repo that adopts it calls it from its own `ci.yml`, pinned to a release like `ruby-ci.yml`, and lists it in `ci-gate`. |
 
 Changing the shared RuboCop rules means updating `rubocop/` and the two hashes in `ruby-ci.yml` together (`self-check.yml` enforces this). Each repo then copies the new files in the PR that moves its pin to the release with the change (see below).
 
